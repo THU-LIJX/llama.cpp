@@ -303,6 +303,12 @@
     const type prefix##3 = (pointer)->array[3]; \
     GGML_UNUSED(prefix##3);
 
+// GGML_TENSOR_LOCALS(int64_t, ne0, src0, ne) expands to:
+// const int64_t ne00 = (src0)->ne[2];
+// const int64_t ne01 = (src0)->ne[2];
+// const int64_t ne02 = (src0)->ne[2];
+// const int64_t ne03 = (src0)->ne[3];
+
 #define GGML_TENSOR_UNARY_OP_LOCALS \
     GGML_TENSOR_LOCALS(int64_t, ne0, src0, ne) \
     GGML_TENSOR_LOCALS(size_t,  nb0, src0, nb) \
@@ -505,6 +511,7 @@ extern "C" {
         GGML_OP_UPSCALE, // nearest interpolate
         GGML_OP_PAD,
         GGML_OP_ARANGE,
+        GGML_OP_ARANGE_DROP,
         GGML_OP_TIMESTEP_EMBEDDING,
         GGML_OP_ARGSORT,
         GGML_OP_LEAKY_RELU,
@@ -1787,6 +1794,14 @@ extern "C" {
             float                 start,
             float                 stop,
             float                 step);
+    
+    GGML_API struct ggml_tensor * ggml_arange_drop(
+            struct ggml_context * ctx,
+            struct ggml_tensor *  drop,
+            int32_t               start,
+            int32_t               stop,
+            int32_t               n_drop,
+            int32_t               bias);
 
     // top k elements per row
     GGML_API struct ggml_tensor * ggml_top_k(

@@ -251,6 +251,9 @@ extern "C" {
         llama_pos    all_pos_0;  // used if pos == NULL
         llama_pos    all_pos_1;  // used if pos == NULL
         llama_seq_id all_seq_id; // used if seq_id == NULL
+        int32_t      img_start_pos;
+        int32_t      img_token_len;
+        int32_t      img_token_step;
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -480,6 +483,7 @@ extern "C" {
 
     // Get a llama model tensor
     LLAMA_API struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name);
+    LLAMA_API struct ggml_tensor * llama_get_model_tok_embd(const struct llama_model * model);
 
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);

@@ -146,6 +146,76 @@ static struct llava_image_embed * load_image(llava_context * ctx_llava, gpt_para
     return embed;
 }
 
+static void compute_tokens_embeddings(struct llama_context * ctx_llama, std::vector<llama_token> & tokens, float * embds) {
+    llama_batch batch = llama_batch_get_one(&tokens[0], tokens.size(), 0, 0);
+
+    int n_embd = llama_n_embd(llama_get_model(ctx_llama));
+    // n_tokens * n_embd * sizeof(float)
+
+    struct ggml_init_params params {
+        /* .mem_size = */ tokens.size() * n_embd * sizeof(float) * 10,
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc = */ false,
+    };
+    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+    struct ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch.n_tokens);
+    memcpy(inp_tokens->data, &tokens[0], batch.n_tokens * sizeof(int32_t));
+
+    // TODO: delete debug code
+    // struct ggml_tensor * inp_arange_drop = ggml_arange_drop(ctx0, inp_tokens, 0, 1000, 2, 0);
+
+    // ggml_build_forward_expand(gf, inp_arange_drop);
+    // ggml_graph_compute_with_ctx(ctx0, gf, 1);
+    // end
+
+
+    struct ggml_tensor * tok_embd = llama_get_model_tok_embd(llama_get_model(ctx_llama));
+    struct ggml_tensor * inp_embd = ggml_get_rows(ctx0, tok_embd, inp_tokens);
+    struct ggml_tensor * inp_embd_flat = ggml_view_1d(ctx0, inp_embd, n_embd * batch.n_tokens, 0);
+
+
+    // struct ggml_tensor * inp_embd_flat_5 = ggml_view_1d(ctx0, inp_embd_flat, 5, 0);
+    // struct ggml_tensor * inp_embd_flat_order = ggml_argsort(ctx0, inp_embd_flat_5, GGML_SORT_ORDER_ASC);
+    // ggml_build_forward_expand(gf, inp_embd_flat_order);
+    // struct ggml_tensor * inp_embd_flat_topk = ggml_top_k(ctx0, inp_embd_flat_5, 3);
+    // ggml_build_forward_expand(gf, inp_embd_flat_topk);
+
+    ggml_build_forward_expand(gf, inp_embd_flat);
+
+    ggml_graph_compute_with_ctx(ctx0, gf, 1);
+    struct ggml_tensor * result = ggml_graph_node(gf, -1);
+
+    memcpy(embds, result->data, n_embd * batch.n_tokens * sizeof(float));
+    ggml_free(ctx0);
+}
+
+
+static bool eval_text_img_prompt(struct llama_context * ctx_llama, struct llava_image_embed * image_embed, const char * str1, const char * str2, int * n_past) {
+    std::string system_prompt = str1;
+    std::string user_prompt = str2;
+    std::vector<llama_token> sys_tokens = ::llama_tokenize(ctx_llama, system_prompt, true, true);
+    std::vector<llama_token> user_tokens = ::llama_tokenize(ctx_llama, user_prompt, false, true);
+
+    int n_embd = llama_n_embd(llama_get_model(ctx_llama));
+    float * embds = new float[sys_tokens.size() * n_embd + user_tokens.size() * n_embd + image_embed->n_image_pos * n_embd];
+    compute_tokens_embeddings(ctx_llama, sys_tokens, embds);
+    memcpy(embds + sys_tokens.size() * n_embd, image_embed->embed, image_embed->n_image_pos * n_embd * sizeof(float));
+    compute_tokens_embeddings(ctx_llama, user_tokens, embds + (sys_tokens.size() + image_embed->n_image_pos) * n_embd);
+
+    int32_t n_eval = sys_tokens.size() + image_embed->n_image_pos + user_tokens.size();
+    // TODO: 这里假设了模型的层数为32
+    llama_batch batch = {n_eval, nullptr, embds, nullptr, nullptr, nullptr, nullptr, 0, 1, 0, (int32_t) sys_tokens.size(), image_embed->n_image_pos, image_embed->n_image_pos/32};
+    // llama_batch batch = {sys_tokens.size() + image_embed->n_image_pos + user_tokens.size(), nullptr, embds, nullptr, nullptr, nullptr, nullptr, 0, 1, 0, sys_tokens.size(), image_embed->n_image_pos, 1};
+    if (llama_decode(ctx_llama, batch)) {
+        LOG_ERR("%s : failed to eval\n", __func__);
+        return false;
+    }
+    *n_past += sys_tokens.size() + image_embed->n_image_pos + user_tokens.size();
+    return true;
+}
+
 static void process_prompt(struct llava_context * ctx_llava, struct llava_image_embed * image_embed, gpt_params * params, const std::string & prompt) {
     int n_past = 0;
 
@@ -183,9 +253,10 @@ static void process_prompt(struct llava_context * ctx_llava, struct llava_image_
         }
     }
 
-    eval_string(ctx_llava->ctx_llama, system_prompt.c_str(), params->n_batch, &n_past, true);
-    llava_eval_image_embed(ctx_llava->ctx_llama, image_embed, params->n_batch, &n_past);
-    eval_string(ctx_llava->ctx_llama, user_prompt.c_str(), params->n_batch, &n_past, false);
+    // eval_string(ctx_llava->ctx_llama, system_prompt.c_str(), params->n_batch, &n_past, true);
+    // llava_eval_image_embed(ctx_llava->ctx_llama, image_embed, params->n_batch, &n_past);
+    // eval_string(ctx_llava->ctx_llama, user_prompt.c_str(), params->n_batch, &n_past, false);
+    eval_text_img_prompt(ctx_llava->ctx_llama, image_embed, system_prompt.c_str(), user_prompt.c_str(), &n_past);
 
     // generate the response
 

@@ -3024,7 +3024,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_ADAMW",
 };
 
-static_assert(GGML_OP_COUNT == 80, "GGML_OP_COUNT != 80");
+static_assert(GGML_OP_COUNT == 81, "GGML_OP_COUNT != 81");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -3118,7 +3118,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "adamw(x)",
 };
 
-static_assert(GGML_OP_COUNT == 80, "GGML_OP_COUNT != 80");
+static_assert(GGML_OP_COUNT == 81, "GGML_OP_COUNT != 81");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3945,6 +3945,14 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         data_size *= ne[i];
     }
 
+    // if (view_src != NULL && data_size != 0) {
+    //     printf("view_src: %p data_size: %ld view_offs: %ld ggml_nbtyes(view_src): %ld\n", view_src, data_size, view_offs, ggml_nbytes(view_src));
+    //     printf("view_src->ne[0]: %d, view_src->ne[1]: %d, view_src->ne[2]: %d, view_src->ne[3]: %d\n", view_src->ne[0], view_src->ne[1], view_src->ne[2], view_src->ne[3]);
+    //     printf("view_src->nb[0]: %d, view_src->nb[1]: %d, view_src->nb[2]: %d, view_src->nb[3]: %d\n", view_src->nb[0], view_src->nb[1], view_src->nb[2], view_src->nb[3]);
+    // }
+    // else {
+    //     printf("view_src: %p data_size: %ld view_offs: %ld\n", view_src, data_size, view_offs);
+    // }
     GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src));
 
     void * data = view_src != NULL ? view_src->data : NULL;
@@ -7373,6 +7381,31 @@ struct ggml_tensor * ggml_arange(
     ggml_set_op_params_f32(result, 1, stop);
     ggml_set_op_params_f32(result, 2, step);
 
+    return result;
+}
+
+// ggml_arange_drop
+struct ggml_tensor * ggml_arange_drop(
+    struct ggml_context * ctx,
+    struct ggml_tensor * drop,
+    int32_t start,
+    int32_t stop,
+    int32_t n_drop,
+    int32_t bias) {
+    // TODO：check是否需要添加node相关的逻辑
+    
+    // step = 1
+    GGML_ASSERT(stop > start);
+
+    const int64_t steps = (int64_t) (stop - start - n_drop);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, steps);
+
+    result->op = GGML_OP_ARANGE_DROP;
+    result->src[0] = drop;
+    ggml_set_op_params_i32(result, 0, start);
+    ggml_set_op_params_i32(result, 1, stop);
+    ggml_set_op_params_i32(result, 2, n_drop);
+    ggml_set_op_params_i32(result, 3, bias);
     return result;
 }
 
@@ -13722,7 +13755,9 @@ static void ggml_compute_forward_cpy(
 static void ggml_compute_forward_cont(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
+    // printf("[forward_cont]\n");
     ggml_compute_forward_dup(params, dst);
+    // printf("[forward_cont end]\n");
 }
 
 // ggml_compute_forward_reshape
@@ -13750,9 +13785,11 @@ static void ggml_compute_forward_view(
 static void ggml_compute_forward_permute(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * dst) {
+    // printf("[forward_permute]\n");
     // NOP
     UNUSED(params);
     UNUSED(dst);
+    // printf("[forward_permute end]\n");
 }
 
 // ggml_compute_forward_transpose
@@ -13939,6 +13976,8 @@ static void ggml_compute_forward_get_rows(
         struct ggml_tensor * dst) {
 
     const struct ggml_tensor * src0 = dst->src[0];
+    // printf("[get_rows]: src0->ne[0]: %d, src0->ne[1]: %d, src0->ne[2]: %d, src0->ne[3]: %d\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
+    // printf("[get_rows]: dst->ne[0]: %d, dst->ne[1]: %d, dst->ne[2]: %d, dst->ne[3]: %d\n", dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
@@ -14005,6 +14044,7 @@ static void ggml_compute_forward_get_rows(
     //    printf("\n");
     //    exit(0);
     //}
+    // printf("[get_rows end]\n");
 }
 
 // ggml_compute_forward_get_rows_back
@@ -15903,6 +15943,79 @@ static void ggml_compute_forward_arange(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_arange_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+
+// ggml_compute_forward_arange
+
+static void ggml_compute_forward_arange_drop_i32(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst) {
+    
+    const struct ggml_tensor * src0 = dst->src[0];
+    // printf("[forward_arange_drop_i32]: dst->ne[0]: %d\n", dst->ne[0]);
+
+    GGML_ASSERT(dst->nb[0] == sizeof(int));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int32_t start   = ggml_get_op_params_i32(dst, 0);
+    const int32_t stop    = ggml_get_op_params_i32(dst, 1);
+    const int32_t n_drop  = ggml_get_op_params_i32(dst, 2);
+    const int32_t bias    = ggml_get_op_params_i32(dst, 3);
+    const int32_t step    = 1;
+
+    const int64_t steps = (int64_t) (stop - start - n_drop);
+
+    GGML_ASSERT(src0->ne[0] >= n_drop);
+    GGML_ASSERT(ggml_nelements(dst) == steps);
+
+    // printf("-----start-----\n");
+    // printf("src0->ne[0]: %d\n", src0->ne[0]);
+    // printf("dst->ne[0]: %d\n", dst->ne[0]);
+    // for (int i = 0; i < src0->ne[0]; i++)
+    //     printf("%d ", ((int32_t*)src0->data)[i] + bias);
+    // printf("\n");
+    // printf("------end----\n");
+
+
+    if (ith == 0) {
+        bool tmp[4096] = {0};
+        for (int i = 0; i < n_drop; i++) {
+            tmp[((int32_t*)src0->data)[i] + bias] = 1;
+        }
+        for (int64_t i = 0, j = 0; i < steps; i += 1) {
+            while (tmp[j]) j++;
+            ((int32_t *)dst->data)[i] = j;
+            j++;
+        }
+    }
+
+    // int32_t * drop_id = (int32_t*) src0->data;
+    // for (int64_t i = ith; i < steps; i+= nth) {
+    //     int32_t value = start + step * i;
+    //     // while (tmp[value]) {
+    //     // }
+    //     if (value >= *drop_id + bias) value += 1;
+    //     ((int32_t *)dst->data)[i] = value;
+    // }
+    // printf("[forward_arange_drop_i32 end]\n");
+}
+
+static void ggml_compute_forward_arange_drop(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_I32:
+            {
+                ggml_compute_forward_arange_drop_i32(params, dst);
             } break;
         default:
             {
@@ -17856,6 +17969,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_arange(params, tensor);
             } break;
+        case GGML_OP_ARANGE_DROP:
+            {
+                ggml_compute_forward_arange_drop(params, tensor);
+            } break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             {
                 ggml_compute_forward_timestep_embedding(params, tensor);
@@ -18930,6 +19047,10 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
+        case GGML_OP_ARANGE_DROP:
+            {
+                GGML_ABORT("fatal error"); // TODO: not implemented
+            }
         case GGML_OP_TIMESTEP_EMBEDDING:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
@@ -19686,6 +19807,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_UPSCALE:
         case GGML_OP_PAD:
         case GGML_OP_ARANGE:
+        case GGML_OP_ARANGE_DROP:
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_ARGSORT:
         case GGML_OP_FLASH_ATTN_EXT:

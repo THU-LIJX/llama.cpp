@@ -2758,6 +2758,9 @@ struct llama_ubatch {
     int32_t      *  n_seq_id; // [n_seqs]
     llama_seq_id ** seq_id;   // [n_seqs]
     int8_t       *  output;   // [n_tokens]
+    int32_t         img_start_pos;
+    int32_t         img_token_len;
+    int32_t         img_token_step;
 };
 
 struct llama_kv_cell {
@@ -9524,6 +9527,253 @@ static struct ggml_tensor * llm_build_kv(
     return cur;
 }
 
+/*
+    TODO:
+        done 1. 将image_token的attension_score切片 
+        done 2. 用ggml_argsort把最小值找出来         
+        done 3. 删掉这个image_token
+        4. 改成删除image_token
+        5. check一下rot_embedding
+        6. 改成删除多个image_token
+*/
+
+static struct ggml_tensor * llm_build_kqv_drop(
+        struct ggml_context * ctx,
+       struct llama_context & lctx,
+       const llama_kv_cache & kv,
+         struct ggml_cgraph * graph,
+         struct ggml_tensor * wo,
+         struct ggml_tensor * wo_b,
+         struct ggml_tensor * q_cur,
+         struct ggml_tensor * kq_mask,
+         struct ggml_tensor * & inpSA,
+         struct ggml_tensor * & inp_pos,
+                    int32_t   n_tokens,
+                    int32_t   n_kv,
+                    int32_t   img_start_pos,
+                    int32_t   img_token_len,
+                    int32_t   img_token_step,
+                    float     kq_scale,
+         const llm_build_cb & cb,
+                    int       il) {
+    const llama_model   & model   = lctx.model;
+    const llama_hparams & hparams = lctx.model.hparams;
+    const llama_cparams & cparams = lctx.cparams;
+
+    const int64_t n_ctx         = cparams.n_ctx;
+    const int64_t n_head        = hparams.n_head(il);
+    const int64_t n_head_kv     = hparams.n_head_kv(il);
+    const int64_t n_embd_head_k = hparams.n_embd_head_k;
+    const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa(il);
+    const int64_t n_embd_head_v = hparams.n_embd_head_v;
+    const int64_t n_embd_v_gqa  = hparams.n_embd_v_gqa(il);
+
+    // q: (n_head, n_tokens, n_head_dim)
+    struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
+    cb(q, "q", il);
+
+    // n_kv是n_token经过padding之后的值，会是32的倍数
+    // k: (n_head_kv, n_kv, n_head_dim)
+    struct ggml_tensor * k =
+        ggml_view_3d(ctx, kv.k_l[il],
+                n_embd_head_k, n_kv, n_head_kv,
+                ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa),
+                ggml_row_size(kv.k_l[il]->type, n_embd_head_k),
+                0);
+    cb(k, "k", il);
+
+    struct ggml_tensor * cur;
+
+    if (cparams.flash_attn) {
+        GGML_UNUSED(model);
+        GGML_UNUSED(n_ctx);
+
+        // split cached v into n_head heads (not transposed)
+        struct ggml_tensor * v =
+            ggml_view_3d(ctx, kv.v_l[il],
+                    n_embd_head_v, n_kv, n_head_kv,
+                    ggml_row_size(kv.v_l[il]->type, n_embd_v_gqa),
+                    ggml_row_size(kv.v_l[il]->type, n_embd_head_v),
+                    0);
+        cb(v, "v", il);
+
+        cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+
+        if (model.arch == LLM_ARCH_PHI2 || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GPTNEOX || model.arch == LLM_ARCH_GEMMA2) {
+            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        }
+
+        cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);
+    } else {
+        // kq: (n_head, n_tokens, n_kv)
+        // 每一行代表该token对之前token的attention_score
+        struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+        cb(kq, "kq", il);
+
+
+        if (model.arch == LLM_ARCH_PHI2 || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GPTNEOX || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_NEMOTRON || model.arch == LLM_ARCH_CHATGLM) {
+            // for this arch, we need to perform the KQ multiplication with F32 precision, otherwise we get NaNs
+            // ref: https://github.com/ggerganov/llama.cpp/pull/4490#issuecomment-1859055847
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        }
+
+        if (model.arch == LLM_ARCH_GROK) {
+            // need to do the following:
+            // multiply by attn_output_multiplyer of 0.08838834764831845
+            // and then :
+            // kq = 30 * tanh(kq / 30)
+            // before the softmax below
+
+            //try from phi2
+            //ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+
+            kq = ggml_tanh(ctx, ggml_scale(ctx, kq, 0.08838834764831845f/30.0f));
+            kq = ggml_scale(ctx, kq, 30);
+        }
+
+        if (hparams.attn_soft_cap) {
+            kq = ggml_scale(ctx, kq, 1.0f / hparams.f_attn_logit_softcapping);
+            kq = ggml_tanh(ctx, kq);
+            kq = ggml_scale(ctx, kq, hparams.f_attn_logit_softcapping);
+        }
+
+        kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+        cb(kq, "kq_soft_max_ext", il);
+
+        GGML_ASSERT(kv.size == n_ctx);
+
+        // split cached v into n_head heads
+        // v: (n_kv_head, n_head_dim, n_kv)
+        struct ggml_tensor * v =
+            ggml_view_3d(ctx, kv.v_l[il],
+                    n_kv, n_embd_head_v, n_head_kv,
+                    ggml_element_size(kv.v_l[il])*n_ctx,
+                    ggml_element_size(kv.v_l[il])*n_ctx*n_embd_head_v,
+                    0);
+        cb(v, "v", il);
+
+        // (n_head, n_tokens, n_head_dim)
+        struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
+        cb(kqv, "kqv", il);
+
+        // (n_tokens, n_head, n_head_dim)
+        struct ggml_tensor * kqv_merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
+        cb(kqv_merged, "kqv_merged", il);
+
+        cur = ggml_cont_2d(ctx, kqv_merged, n_embd_head_v*n_head, n_tokens);
+        cb(cur, "kqv_merged_cont", il);
+
+        if (n_tokens > 1) {
+            // 用最后一个token对前面img_token的attention_score删除token，删掉attention_score最小的token
+            // 第il层的img_token数量为: img_token_len - il * img_token_step
+
+            int32_t img_token_len_il = img_token_len - il * img_token_step;
+            // kq: (n_head, n_tokens, n_kv)
+            // kq_last_token: (n_head, n_kv)
+            // struct ggml_tensor * kq_last_token_to_img_token = ggml_view_2d(ctx, kq, kq->ne[0], kq->ne[2], kq->nb[2], kq->nb[2]-kq->nb[1]);
+            // kq_last_token_to_img_token: (n_head, img_token_len_il)
+            struct ggml_tensor * kq_last_token_to_img_token = ggml_view_2d(ctx, kq, img_token_len_il, kq->ne[2], kq->nb[2], kq->nb[2]-kq->nb[1]+img_start_pos*sizeof(float));
+            // kq_last_token_head_sum: (n_kv)
+            struct ggml_tensor * tmp1 = ggml_permute(ctx, kq_last_token_to_img_token, 1, 0, 2, 3);
+            struct ggml_tensor * tmp2 = ggml_cont_2d(ctx, tmp1, tmp1->ne[0], tmp1->ne[1]);
+            struct ggml_tensor * kq_last_token_head_sum = ggml_permute(ctx, ggml_sum_rows(ctx, tmp2), 1, 0, 2, 3);
+            // kq_last_token_head_sum_idx_ascend: (n_kv)
+            struct ggml_tensor * kq_last_token_head_sum_idx_ascend = ggml_argsort(ctx, kq_last_token_head_sum, GGML_SORT_ORDER_ASC);
+            // struct ggml_tensor * kq_last_token_head_sum_idx_ascend = ggml_cast(ctx, ggml_add(ctx, 
+            //                                                                                  ggml_cast(ctx, ggml_argsort(ctx, kq_last_token_head_sum, GGML_SORT_ORDER_ASC), GGML_TYPE_F32),
+            //                                                                                  ggml_set_f32(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, img_token_len_il), img_start_pos)),
+            //                                                                    GGML_TYPE_I32);
+
+            // kq_drp_token_idx
+            // struct ggml_tensor * kq_drp_token_idx = ggml_view_1d(ctx, kq_last_token_head_sum_idx_ascend, 1, 0);
+            // kq_res_token_idx
+            struct ggml_tensor * kq_res_token_idx = ggml_arange_drop(ctx, kq_last_token_head_sum_idx_ascend, 0, n_tokens, img_token_step, img_start_pos);
+
+            struct ggml_tensor * cur_res = ggml_get_rows(ctx, cur, kq_res_token_idx);
+            struct ggml_tensor * cur_res_cont = ggml_cont_2d(ctx, cur_res, n_embd_head_v*n_head, kq_res_token_idx->ne[0]);
+
+            inpSA = ggml_get_rows(ctx, inpSA, kq_res_token_idx);
+            inpSA = ggml_cont_2d(ctx, inpSA, n_embd_head_v*n_head, kq_res_token_idx->ne[0]);
+
+            struct ggml_tensor * tmp3 = ggml_permute(ctx, inp_pos, 1, 0, 2, 3);
+            struct ggml_tensor * tmp4 = ggml_cont_2d(ctx, tmp3, tmp3->ne[0], tmp3->ne[1]);
+            inp_pos = ggml_get_rows(ctx, tmp4, kq_res_token_idx);
+            inp_pos = ggml_permute(ctx, inp_pos, 1, 0, 2, 3);
+            inp_pos = ggml_cont_1d(ctx, inp_pos, kq_res_token_idx->ne[0]);
+
+            cur = cur_res_cont;
+            // struct ggml_tensor * kqv_merged_cont_1 = ggml_view_2d(ctx, cur, n_embd_head_v*n_head, kq_drop_token_idx, cur->nb[1], 0);
+            // struct ggml_tensor * kqv_merged_cont_2 = ggml_view_2d(ctx, cur, n_embd_head_v*n_head, n_tokens-kq_drop_token_idx-1, cur->nb[1], kq_drop_token_idx * cur->nb[1]);
+            // struct ggml_tensor * kqv_merged_cont_drop = ggml_concat(ctx, kqv_merged_cont_1, kqv_merged_cont_2, 1);
+            // cur = kqv_merged_cont_drop;
+        }
+        
+    }
+
+    ggml_build_forward_expand(graph, cur);
+
+    if (wo) {
+        cur = llm_build_lora_mm(lctx, ctx, wo, cur);
+    }
+
+    if (wo_b) {
+        cb(cur, "kqv_wo", il);
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx, cur, wo_b);
+    }
+
+    return cur;
+}
+
+static struct ggml_tensor * llm_build_kv_drop(
+        struct ggml_context * ctx,
+       struct llama_context & lctx,
+       const llama_kv_cache & kv,
+         struct ggml_cgraph * graph,
+         struct ggml_tensor * wo,
+         struct ggml_tensor * wo_b,
+         struct ggml_tensor * k_cur,
+         struct ggml_tensor * v_cur,
+         struct ggml_tensor * q_cur,
+         struct ggml_tensor * kq_mask,
+         struct ggml_tensor * & inpSA,
+         struct ggml_tensor * & inp_pos,
+                    int32_t   n_tokens,
+                    int32_t   kv_head,
+                    int32_t   n_kv,
+                    int32_t   img_start_pos,
+                    int32_t   img_token_len,
+                    int32_t   img_token_step,
+                    float     kq_scale,
+         const llm_build_cb & cb,
+                    int       il) {
+    const llama_hparams & hparams = lctx.model.hparams;
+    const llama_cparams & cparams = lctx.cparams;
+        
+    // these nodes are added to the graph together so that they are not reordered
+    // by doing so, the number of splits in the graph is reduced
+    ggml_build_forward_expand(graph, q_cur);
+    ggml_build_forward_expand(graph, k_cur);
+    ggml_build_forward_expand(graph, v_cur);
+
+    llm_build_kv_store(ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il);
+
+    // n_embd = n_head * n_head_dim
+    // q_cur: (n_tokens, n_head, n_head_dim)
+    // k_cur: (n_tokens, n_head_kv, n_head_dim)
+    // v_cur: (n_tokens, n_embd)
+
+    struct ggml_tensor * cur;
+    cur  = llm_build_kqv_drop(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, inpSA, inp_pos, n_tokens, n_kv, img_start_pos, img_token_len, img_token_step, kq_scale, cb, il);
+    cb(cur, "kqv_out", il);
+
+    return cur;
+}
+
+
 static struct ggml_tensor * llm_build_copy_mask_state(
         struct ggml_context * ctx,
          struct ggml_cgraph * graph,
@@ -10285,16 +10535,28 @@ struct llm_build_context {
         struct ggml_tensor * cur;
         struct ggml_tensor * inpL;
 
+        // TODO: 搞清楚input的形状
+        // inpL: (n_tokens, n_embd)
         inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
 
         // inp_pos - contains the positions
+        // inp_pos: (n_tokens)
         struct ggml_tensor * inp_pos = build_inp_pos();
 
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
         struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
+        // inpL = ggml_view_2d(ctx0, inpL, inpL->ne[0], 1, inpL->nb[1], (inpL->ne[1] - 1) * inpL->nb[1]);
+        // inp_pos = ggml_view_1d(ctx0, inp_pos, 1, 0);
+
         const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
         for (int il = 0; il < n_layer; ++il) {
+            // // TODO：添加算子，将inpL的第一个token移除
+            // int tmp_token = 2;
+            // if (inpL->ne[1] > tmp_token) {
+            //     inpL = ggml_view_2d(ctx0, inpL, inpL->ne[0], inpL->ne[1]-tmp_token, inpL->nb[1], tmp_token * inpL->nb[1]);
+            //     inp_pos = ggml_view_1d(ctx0, inp_pos, inp_pos->ne[0]-tmp_token, 0);
+            // }
             struct ggml_tensor * inpSA = inpL;
 
             // norm
@@ -10331,22 +10593,22 @@ struct llm_build_context {
                 }
 
                 Qcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, rope_factors,
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, inp_pos->ne[0]), inp_pos, rope_factors,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
                 Kcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, rope_factors,
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, inp_pos->ne[0]), inp_pos, rope_factors,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, lctx, kv_self, gf,
+                cur = llm_build_kv_drop(ctx0, lctx, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, kq_scale, cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, inpSA, inp_pos, inp_pos->ne[0], kv_head, n_kv, batch.img_start_pos, batch.img_token_len, batch.img_token_step, kq_scale, cb, il);
             }
 
             if (il == n_layer - 1) {
@@ -15908,6 +16170,7 @@ static struct ggml_cgraph * llama_build_graph_k_shift(llama_context & lctx) {
     return result;
 }
 
+// TODO
 static struct ggml_cgraph * llama_build_graph(
          llama_context & lctx,
     const llama_ubatch & batch,
@@ -16203,6 +16466,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
     const auto & cparams = lctx.cparams;
     const auto & kv_self = lctx.kv_self;
 
+    // TODO
     if (batch.token) {
         const int64_t n_tokens = batch.n_tokens;
 
@@ -16216,12 +16480,14 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
         ggml_backend_tensor_set(lctx.inp_embd, batch.embd, 0, n_tokens*n_embd*ggml_element_size(lctx.inp_embd));
     }
 
+    // TODO
     if (batch.pos && lctx.inp_pos) {
         const int64_t n_tokens = batch.n_tokens;
 
         ggml_backend_tensor_set(lctx.inp_pos, batch.pos, 0, n_tokens*ggml_element_size(lctx.inp_pos));
     }
 
+    // TODO
     if (hparams.causal_attn || cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
         GGML_ASSERT(lctx.inp_out_ids && "every model that can must skip unused outputs");
         const int64_t n_tokens = batch.n_tokens;
@@ -16229,20 +16495,27 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
         GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_out_ids->buffer));
         int32_t * data = (int32_t *) lctx.inp_out_ids->data;
 
+        // printf("lctx.n_outputs: %d\n", lctx.n_outputs);
+
         if (lctx.n_outputs == n_tokens) {
+            // printf("lctx.n_putput == n_tokens\n");
             for (int i = 0; i < n_tokens; ++i) {
                 data[i] = i;
             }
         } else if (batch.output) {
+            // printf("batch output. n_tokens: %d\n", n_tokens);
             int32_t n_outputs = 0;
             for (int i = 0; i < n_tokens; ++i) {
                 if (batch.output[i]) {
-                    data[n_outputs++] = i;
+                    // TODO: change it back!!!!!
+                    // data[n_outputs++] = std::max(0, 0);
+                    data[n_outputs++] = i - batch.img_token_len;
                 }
             }
             // the graph needs to have been passed the correct number of outputs
             GGML_ASSERT(lctx.n_outputs == n_outputs);
         } else if (lctx.n_outputs == 1) {
+            // printf("lctx.n_putput == 1\n");
             // only keep last output
             data[0] = n_tokens - 1;
         } else {
@@ -16257,6 +16530,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
         "causal attention is not supported by this model"
     );
 
+    // TODO
     if (lctx.inp_KQ_mask || lctx.inp_KQ_mask_swa) {
         // NOTE: hparams.causal_attn indicates the model is capable of generation and uses the kv cache.
         if (cparams.causal_attn && !lctx.is_encoding) {
@@ -16291,6 +16565,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
 
                         for (int i = 0; i < n_kv; ++i) {
                             float f;
+                            // 改变了mask，但没有减少计算量，因为mask是在计算完attention之后叠加的
+                            // if (!kv_self.cells[i].has_seq_id(seq_id) || kv_self.cells[i].pos > pos || pos - kv_self.cells[i].pos >= 10) {
                             if (!kv_self.cells[i].has_seq_id(seq_id) || kv_self.cells[i].pos > pos) {
                                 f = -INFINITY;
                             } else {
@@ -16302,6 +16578,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
                             }
 
                             if (data) {
+                                // data: (n_batch, n_seqs, n_seq_tokens, n_kv)
+                                // data[h][s][j][i] = f
                                 data[h*(n_kv*n_tokens) + s*(n_kv*n_seq_tokens) + j*n_kv + i] = f;
                             }
 
@@ -16753,6 +17031,7 @@ static int llama_decode_internal(
 
     GGML_ASSERT((!batch_all.token && batch_all.embd) || (batch_all.token && !batch_all.embd)); // NOLINT
 
+    // 检查token在vocab的范围
     if (batch_all.token) {
         for (uint32_t i = 0; i < n_tokens_all; ++i) {
             if (batch_all.token[i] < 0 || (uint32_t)batch_all.token[i] >= model.vocab.n_vocab) {
@@ -16780,6 +17059,7 @@ static int llama_decode_internal(
     uint32_t n_outputs_prev = 0;
 
     const auto n_ubatch = cparams.n_ubatch;
+    // const auto n_ubatch = 1024;
 
     // this indicates we are doing pooled embedding, so we ignore batch.logits and output all tokens
     const bool embd_pooled = cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
@@ -16875,6 +17155,10 @@ static int llama_decode_internal(
         ggml_backend_sched_reset(lctx.sched);
         ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 
+        // TODO: 检查ubatch
+        ubatch.img_start_pos = batch_all.img_start_pos;
+        ubatch.img_token_len = batch_all.img_token_len;
+        ubatch.img_token_step = batch_all.img_token_step;
         ggml_cgraph * gf = llama_build_graph(lctx, ubatch, false);
 
         // the output is always the last tensor in the graph
@@ -16905,6 +17189,7 @@ static int llama_decode_internal(
 
         llama_set_inputs(lctx, ubatch);
 
+        // 实际计算
         llama_graph_compute(lctx, gf, n_threads, threadpool);
 
         // update the kv ring buffer
@@ -21475,4 +21760,8 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
     (void) user_data;
     fputs(text, stderr);
     fflush(stderr);
+}
+
+struct ggml_tensor * llama_get_model_tok_embd(const struct llama_model * model) {
+    return model->tok_embd;
 }
