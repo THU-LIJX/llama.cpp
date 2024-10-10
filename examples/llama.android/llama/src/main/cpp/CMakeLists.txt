@@ -49,5 +49,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         # List libraries link to the target library
         llama
         common
+        llava
+        llava-cli
         android
         log)

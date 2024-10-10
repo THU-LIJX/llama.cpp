@@ -30,6 +30,7 @@ class MainViewModel(private val llamaAndroid: LLamaAndroid = LLamaAndroid.instan
         viewModelScope.launch {
             try {
                 llamaAndroid.unload()
+//                llamaAndroid.unload_llava();
             } catch (exc: IllegalStateException) {
                 messages += exc.message!!
             }
@@ -51,6 +52,25 @@ class MainViewModel(private val llamaAndroid: LLamaAndroid = LLamaAndroid.instan
                     messages += it.message!!
                 }
                 .collect { messages = messages.dropLast(1) + (messages.last() + it) }
+        }
+    }
+
+    fun send_llava() {
+        val text = message
+        message = ""
+
+
+        // Add to messages console.
+        messages += text
+        messages += ""
+
+        viewModelScope.launch {
+            llamaAndroid.send_llava(text)
+                .catch {
+                    Log.e(tag, "send_llava() failed", it)
+                    messages += it.message!!
+                }
+                .collect {messages = messages.dropLast(1) + (messages.last() + it)}
         }
     }
 
@@ -86,6 +106,18 @@ class MainViewModel(private val llamaAndroid: LLamaAndroid = LLamaAndroid.instan
                 messages += "Loaded $pathToModel"
             } catch (exc: IllegalStateException) {
                 Log.e(tag, "load() failed", exc)
+                messages += exc.message!!
+            }
+        }
+    }
+
+    fun load_llava() {
+        viewModelScope.launch {
+            try {
+                llamaAndroid.load_llava()
+                messages += "Loaded Llava"
+            } catch (exc: IllegalStateException) {
+                Log.e(tag, "load_llava() failed", exc)
                 messages += exc.message!!
             }
         }

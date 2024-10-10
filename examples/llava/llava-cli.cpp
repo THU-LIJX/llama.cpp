@@ -1,12 +1,9 @@
 #include "arg.h"
 #include "base64.hpp"
 #include "log.h"
-#include "common.h"
 #include "sampling.h"
 #include "clip.h"
-#include "llava.h"
-#include "llama.h"
-#include "ggml.h"
+#include "llava-cli.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -42,7 +39,7 @@ static bool eval_string(struct llama_context * ctx_llama, const char* str, int n
     return true;
 }
 
-static const char * sample(struct gpt_sampler * smpl,
+const char * sample(struct gpt_sampler * smpl,
                            struct llama_context * ctx_llama,
                            int * n_past) {
     const llama_token id = gpt_sampler_sample(smpl, ctx_llama, -1);
@@ -108,19 +105,13 @@ static std::string remove_image_from_prompt(const std::string& prompt, const cha
     return pre + replacement + post;
 }
 
-struct llava_context {
-    struct clip_ctx * ctx_clip = NULL;
-    struct llama_context * ctx_llama = NULL;
-    struct llama_model * model = NULL;
-};
-
 static void print_usage(int, char ** argv) {
     LOG("\n example usage:\n");
     LOG("\n     %s -m <llava-v1.5-7b/ggml-model-q5_k.gguf> --mmproj <llava-v1.5-7b/mmproj-model-f16.gguf> --image <path/to/an/image.jpg> --image <path/to/another/image.jpg> [--temp 0.1] [-p \"describe the image in detail.\"]\n", argv[0]);
     LOG("\n note: a lower temperature value like 0.1 is recommended for better quality.\n");
 }
 
-static struct llava_image_embed * load_image(llava_context * ctx_llava, gpt_params * params, const std::string & fname) {
+struct llava_image_embed * load_image(llava_context * ctx_llava, gpt_params * params, const std::string & fname) {
 
     // load and preprocess the image
     llava_image_embed * embed = NULL;
@@ -146,7 +137,7 @@ static struct llava_image_embed * load_image(llava_context * ctx_llava, gpt_para
     return embed;
 }
 
-static void compute_tokens_embeddings(struct llama_context * ctx_llama, std::vector<llama_token> & tokens, float * embds) {
+void compute_tokens_embeddings(struct llama_context * ctx_llama, std::vector<llama_token> & tokens, float * embds) {
     llama_batch batch = llama_batch_get_one(&tokens[0], tokens.size(), 0, 0);
 
     int n_embd = llama_n_embd(llama_get_model(ctx_llama));
@@ -192,7 +183,7 @@ static void compute_tokens_embeddings(struct llama_context * ctx_llama, std::vec
 }
 
 
-static bool eval_text_img_prompt(struct llama_context * ctx_llama, struct llava_image_embed * image_embed, const char * str1, const char * str2, int * n_past) {
+bool eval_text_img_prompt(struct llama_context * ctx_llama, struct llava_image_embed * image_embed, const char * str1, const char * str2, int * n_past) {
     std::string system_prompt = str1;
     std::string user_prompt = str2;
     std::vector<llama_token> sys_tokens = ::llama_tokenize(ctx_llama, system_prompt, true, true);
@@ -286,7 +277,7 @@ static void process_prompt(struct llava_context * ctx_llava, struct llava_image_
     LOG("\n");
 }
 
-static struct llama_model * llava_init(gpt_params * params) {
+struct llama_model * llava_init(gpt_params * params) {
     llama_backend_init();
     llama_numa_init(params->numa);
 
@@ -300,7 +291,7 @@ static struct llama_model * llava_init(gpt_params * params) {
     return model;
 }
 
-static struct llava_context * llava_init_context(gpt_params * params, llama_model * model) {
+struct llava_context * llava_init_context(gpt_params * params, llama_model * model) {
     const char * clip_path = params->mmproj.c_str();
 
     auto prompt = params->prompt;
@@ -329,7 +320,7 @@ static struct llava_context * llava_init_context(gpt_params * params, llama_mode
     return ctx_llava;
 }
 
-static void llava_free(struct llava_context * ctx_llava) {
+void llava_free(struct llava_context * ctx_llava) {
     if (ctx_llava->ctx_clip) {
         clip_free(ctx_llava->ctx_clip);
         ctx_llava->ctx_clip = NULL;
@@ -339,6 +330,11 @@ static void llava_free(struct llava_context * ctx_llava) {
     llama_free_model(ctx_llava->model);
     llama_backend_free();
 }
+
+// llava_init()
+// llava_init_context()
+// process_prompt()
+// llava_free()
 
 int main(int argc, char ** argv) {
     ggml_time_init();
