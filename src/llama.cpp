@@ -10546,6 +10546,8 @@ struct llm_build_context {
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
         struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
+        const uint32_t kv_self_size = llama_kv_cache_cell_max(kv_self);
+
         // inpL = ggml_view_2d(ctx0, inpL, inpL->ne[0], 1, inpL->nb[1], (inpL->ne[1] - 1) * inpL->nb[1]);
         // inp_pos = ggml_view_1d(ctx0, inp_pos, 1, 0);
 
@@ -10606,9 +10608,18 @@ struct llm_build_context {
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv_drop(ctx0, lctx, kv_self, gf,
+                if(n_tokens > 1)
+                    cur = llm_build_kv_drop(ctx0, lctx, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
                         Kcur, Vcur, Qcur, KQ_mask, inpSA, inp_pos, inp_pos->ne[0], kv_head, n_kv, batch.img_start_pos, batch.img_token_len, batch.img_token_step, kq_scale, cb, il);
+                else{
+                    const uint32_t pad = llama_kv_cache_get_padding(cparams);
+                    int32_t new_n_kv = std::min(kv_self.size - il * batch.img_token_step, std::max(pad, GGML_PAD(kv_self_size - il * batch.img_token_step, pad)));
+                    struct ggml_tensor *new_KQ_mask = ggml_view_1d(ctx0, KQ_mask, new_n_kv, 0);
+                    cur = llm_build_kv_drop(ctx0, lctx, kv_self, gf,
+                        model.layers[il].wo, model.layers[il].bo,
+                        Kcur, Vcur, Qcur, new_KQ_mask, inpSA, inp_pos, inp_pos->ne[0], kv_head - il * batch.img_token_step, new_n_kv, batch.img_start_pos, batch.img_token_len, batch.img_token_step, kq_scale, cb, il);
+                }
             }
 
             if (il == n_layer - 1) {

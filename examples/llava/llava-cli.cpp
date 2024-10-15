@@ -17,7 +17,9 @@ static bool eval_tokens(struct llama_context * ctx_llama, std::vector<llama_toke
         if (n_eval > n_batch) {
             n_eval = n_batch;
         }
-        if (llama_decode(ctx_llama, llama_batch_get_one(&tokens[i], n_eval, *n_past, 0))) {
+        llama_batch batch_one = llama_batch_get_one(&tokens[i], n_eval, *n_past, 0);
+        batch_one.img_token_step = 4;// 需要修改一下实际值
+        if (llama_decode(ctx_llama, batch_one)) {
             LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, N, n_batch, *n_past);
             return false;
         }
