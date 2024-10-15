@@ -89,7 +89,7 @@ class LLamaAndroid {
     private external fun llava_init_context(): Long
     private external fun llava_init_sampler(): Long
     private external fun llava_completion_init(ctx_llava_pointer: Long, image_embed_pointer: Long, system_prompt: String, user_prompt: String): Int
-    private external fun llava_completion_loop(sampler_pointer: Long, ctx_llava_pointer: Long, n_past_tokens: Int): String?
+    private external fun llava_completion_loop(sampler_pointer: Long, image_embed_pointer: Long, ctx_llava_pointer: Long, n_past_tokens: Int): String?
 
     private external fun llava_get_default_gpt_params(): Long
     private external fun llava_init(params_gpt: Long): Long
@@ -246,7 +246,7 @@ class LLamaAndroid {
                 Log.i(tag, "n_past $n")
                 var i = 0
                 while (i < 64) {
-                    val str = llava_completion_loop(state.sampler, state.ctx_llava, n+i);
+                    val str = llava_completion_loop(state.sampler, state.image_embed, state.ctx_llava, n+i);
                     if (str == null) {
                         break
                     }

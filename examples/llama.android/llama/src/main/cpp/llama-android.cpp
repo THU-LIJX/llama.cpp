@@ -645,7 +645,7 @@ Java_android_llama_cpp_LLamaAndroid_llava_1completion_1init(JNIEnv * env, jobjec
 
 extern "C"
 JNIEXPORT jstring JNICALL
-Java_android_llama_cpp_LLamaAndroid_llava_1completion_1loop(JNIEnv * env, jobject, jlong sampler_pointer, jlong ctx_llava_pointer, jint n_past_tokens) {
+Java_android_llama_cpp_LLamaAndroid_llava_1completion_1loop(JNIEnv * env, jobject, jlong sampler_pointer,jlong image_embed_pointer, jlong ctx_llava_pointer, jint n_past_tokens) {
 //    auto smpl = reinterpret_cast<gpt_sampler *>(sampler);
 //    auto ctx_llava_ = reinterpret_cast<struct llava_context *>(ctx_llava);
 //    int n_past_tokens = reinterpret_cast<int>(n_past);
@@ -670,7 +670,9 @@ Java_android_llama_cpp_LLamaAndroid_llava_1completion_1loop(JNIEnv * env, jobjec
 
     std::vector<llama_token> tokens;
     tokens.push_back(new_token_id);
-    if (llama_decode(ctx_llama, llama_batch_get_one(&tokens[0], 1, n_past, 0)) != 0) {
+    llama_batch batch_one = llama_batch_get_one(&tokens[0], 1, n_past, 0);
+    batch_one.img_token_step = image_embed->n_image_pos / 32;
+    if (llama_decode(ctx_llama, batch_one) != 0) {
         LOGe("llava_completion_loop failed");
     }
 
